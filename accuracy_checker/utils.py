@@ -157,6 +157,13 @@ def normalize_quant_desc_keys(quant_desc: dict, model) -> dict:
             new_key = "model.model." + key[len("model."):]
             new_desc[new_key] = value
             new_desc[key] = value
+        elif key.startswith("model.language_model."):
+            # Multimodal checkpoint exported with "model.language_model.*" keys
+            # while the loaded text model exposes plain "model.layers.*"
+            # (Qwen3.5 MoE).  Map down to the real module prefix, keeping the
+            # original key for any consumer that still uses the export form.
+            new_desc["model." + key[len("model.language_model."):]] = value
+            new_desc[key] = value
         elif not has_nested_language_model and key.startswith("model.layers."):
             new_key = "model.model." + key[len("model."):]
             new_desc[new_key] = value
