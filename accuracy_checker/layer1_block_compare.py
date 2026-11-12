@@ -67,6 +67,12 @@ _ACTIVATION_QUANT_TYPES = frozenset({
 
 _WEIGHT_TO_ACTIVATION_QUANT = {
     "W8A8_MXFP8": "W8A8_MXFP8",
+    # Native E4M3 payloads carrying per-block (1x32) E8M0 scales are the same
+    # MXFP8 contract exported without a msModelSlim weight descriptor; the
+    # loader tags them FP8_E4M3 when it decodes the raw bytes.  Without this
+    # alias AUTO silently skips their activation QDQ and the quant side looks
+    # better than the real W8A8 MXFP8 deployment.
+    "FP8_E4M3": "W8A8_MXFP8",
     "W4A8_MXFP": "W4A8_MXFP",
     "W4A4_MXFP4": "W4A4_MXFP4",
     "W4A4_DYNAMIC": "W4A4_DYNAMIC",
@@ -436,6 +442,14 @@ class ShardedBlockComparator:
         self._last_logits_error = None
         self._first_nonfinite_layer = None
         self._activation_hooks = []  # track registered hooks for cleanup
+
+        # Optional per-layer MoE routing trace (ref vs quant expert selection).
+        # Enabled by ACC_ROUTING_TRACE_DIR=<dir>; writes routing_ref.jsonl and
+        # routing_quant.jsonl plus a compare_traces summary.  No model math is
+        # changed: the actual chosen IDs and aggregation weights are recorded.
+        self.routing_trace_dir = os.environ.get("ACC_ROUTING_TRACE_DIR") or None
+        self._routing_collectors = {}
+        self._routing_trace_summary = None
 
         # Load rotation matrix (optional, for rotated quant models like GLM5.1 QuaRot)
         self.R = None
@@ -1934,7 +1948,7 @@ class ShardedBlockComparator:
 
     def _make_chunked_mlp_forward(self, orig_fwd, layer, devices, chunk_size,
                                     lidx, sf_rdr, q_desc, is_q, is_ct,
-                                    apply_activation_quant=False):
+                                    apply_activation_quant=False, side=None):
         """创建 chunked MLP forward 闭包。"""
         _self = self
         def _chunked_mlp_forward(hidden_states, *args, **kwargs):
@@ -1943,7 +1957,7 @@ class ShardedBlockComparator:
                 layer_idx=lidx, sf_reader=sf_rdr,
                 quant_desc_str=q_desc, is_quant=is_q, is_ct=is_ct,
                 apply_activation_quant=apply_activation_quant,
-                input_ids=kwargs.get("input_ids"))
+                input_ids=kwargs.get("input_ids"), side=side)
         return _chunked_mlp_forward
 
     def _patch_moe_forward_for_layer(self, ref_layer, quant_layer, layer_idx,
@@ -1963,11 +1977,11 @@ class ShardedBlockComparator:
         ref_moe.forward = self._make_chunked_mlp_forward(
             ref_orig_mlp_fwd, ref_layer, self.ref_devices,
             self.expert_chunk_size, layer_idx, ref_reader, _ref_qds,
-            ref_is_quant, ref_is_ct, apply_activation_quant=False)
+            ref_is_quant, ref_is_ct, apply_activation_quant=False, side='ref')
         quant_moe.forward = self._make_chunked_mlp_forward(
             quant_orig_mlp_fwd, quant_layer, self.quant_devices,
             self.expert_chunk_size, layer_idx, quant_reader, _quant_qds,
-            quant_is_quant, quant_is_ct, apply_activation_quant=True)
+            quant_is_quant, quant_is_ct, apply_activation_quant=True, side='quant')
         return ref_moe, ref_orig_mlp_fwd, quant_moe, quant_orig_mlp_fwd
 
     def _log_norm_debug(self, layer_idx, ref_hidden, quant_hidden, stage):
@@ -2210,6 +2224,7 @@ class ShardedBlockComparator:
         is_ct: bool = False,
         apply_activation_quant: bool = False,
         input_ids: Optional[Tensor] = None,
+        side: str = None,
     ) -> Tensor:
         """手动拆解 MoE forward，expert chunk 轮询分发到 devices。
 
@@ -2248,6 +2263,10 @@ class ShardedBlockComparator:
         # ---- MoE router scoring ----
         topk_scores, topk_indices, routed_scaling_factor = self._compute_moe_topk_routing(
             mlp, gate, router_logits, precomputed_scores, precomputed_indices, num_experts_per_tok)
+
+        # Record the *actual* selected experts + aggregation weights for this
+        # side/layer so BF16 and quant routing can be compared token-aligned.
+        self._record_routing(side, layer_idx, topk_indices, topk_scores)
 
         # ---- 2. Detect expert format & streaming mode ----
         experts_mod = mlp.experts
@@ -3638,11 +3657,102 @@ class ShardedBlockComparator:
                 mem = torch.npu.memory_allocated(d) / 1024**3
                 logger.info(f"  [NPU MEM] {d}: {mem:.1f}GB")
 
+    def _record_routing(self, side, layer_idx, topk_indices, topk_scores):
+        """Capture chosen expert IDs / weights for the L1 routing trace."""
+        if not self.routing_trace_dir or side is None or layer_idx is None:
+            return
+        if topk_indices is None or topk_scores is None:
+            return
+        from .moe_routing_trace import MoERoutingCollector
+        collector = self._routing_collectors.get(side)
+        if collector is None:
+            sample_id = "prompt-0"
+            try:
+                import hashlib
+                digest = hashlib.md5(
+                    str(getattr(self, "_prompt_text", "")).encode("utf-8")
+                ).hexdigest()[:12]
+                sample_id = f"prompt-{digest}"
+            except Exception:
+                pass
+            collector = MoERoutingCollector(side=side, sample_id=sample_id)
+            self._routing_collectors[side] = collector
+        try:
+            collector.record(
+                int(layer_idx),
+                topk_indices.detach(),
+                topk_scores.detach(),
+            )
+        except Exception as exc:  # never fail the accuracy run for tracing
+            logger.warning(
+                "  [ROUTING TRACE] skipped layer %s side=%s: %s",
+                layer_idx, side, exc,
+            )
+
+    def _flush_routing_trace(self):
+        """Write both trace jsonl files and a compare_traces summary."""
+        if not self.routing_trace_dir or not self._routing_collectors:
+            return
+        import json
+        from .moe_routing_trace import compare_traces
+        os.makedirs(self.routing_trace_dir, exist_ok=True)
+        paths = {}
+        for side, collector in self._routing_collectors.items():
+            dest = os.path.join(self.routing_trace_dir, f"routing_{side}.jsonl")
+            collector.write_jsonl(dest)
+            paths[side] = dest
+            logger.info(
+                "  [ROUTING TRACE] %s: %d rows -> %s",
+                side, len(collector.records), dest,
+            )
+        if "ref" not in paths or "quant" not in paths:
+            logger.warning(
+                "  [ROUTING TRACE] only one side collected (%s); "
+                "no flip comparison produced", sorted(paths),
+            )
+            return
+        report = compare_traces(
+            self._routing_collectors["ref"].records,
+            self._routing_collectors["quant"].records,
+        )
+        summary = {
+            "summary": report["summary"],
+            "by_layer": report["by_layer"],
+            "ref_only_keys": len(report["ref_only_keys"]),
+            "quant_only_keys": len(report["quant_only_keys"]),
+            "ref_load": report["ref_load"],
+            "quant_load": report["quant_load"],
+        }
+        dest = os.path.join(self.routing_trace_dir, "routing_compare.json")
+        with open(dest, "w", encoding="utf-8") as fh:
+            json.dump(summary, fh, indent=2, ensure_ascii=False)
+        self._routing_trace_summary = summary
+        logger.info(
+            "  [ROUTING TRACE] paired_tokens=%s expert_set_change_rate=%s "
+            "mean_topk_overlap=%s mean_weight_l1=%s -> %s",
+            report["summary"].get("paired_tokens"),
+            report["summary"].get("expert_set_change_rate"),
+            report["summary"].get("mean_topk_overlap"),
+            report["summary"].get("mean_weight_l1"),
+            dest,
+        )
+        for layer in sorted(report["by_layer"], key=lambda k: int(k)):
+            row = report["by_layer"][layer]
+            change = row["expert_set_change_rate"]
+            overlap = row["mean_topk_overlap"]
+            logger.info(
+                "  [ROUTING TRACE] L%-3s change_rate=%s topk_overlap=%s",
+                layer,
+                f"{change:.4f}" if change is not None else "n/a",
+                f"{overlap:.4f}" if overlap is not None else "n/a",
+            )
+
     def _finalize_dual_report(self, ref_model, quant_model, ref_hidden_states,
                                 quant_hidden_states, all_results, ref_reader,
                                 quant_reader, layer_cos_sims, layer_inputs,
                                 use_cpu_topk=False):
         """dual 模式收尾: close readers → cache cleanup → topk → logits → report。"""
+        self._flush_routing_trace()
         ref_reader.close()
         quant_reader.close()
         self._cache_top_k_cleanup(layer_cos_sims, layer_inputs, self.cache_top_k, self.verbose)
